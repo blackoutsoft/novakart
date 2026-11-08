@@ -1,3 +1,7 @@
+# NovaKart
+
+[Develop deployment setup and operations](apps/docs/DEPLOYMENT.md)
+
 # Turborepo starter
 
 This Turborepo starter is maintained by the Turborepo core team.

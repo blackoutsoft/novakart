@@ -1,0 +1,10 @@
+**/.env*
+**/bin
+**/obj
+**/TestResults
+**/test-results
+**/.vs
+**/.idea
+**/*.user
+tests
+.git
