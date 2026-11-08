@@ -1,0 +1,119 @@
+name: API - validate and deploy
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DB_CONNECTION_STRING: Host=localhost;Database=ci_design;Username=ci;Password=ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - run: dotnet tool restore
+      - run: dotnet restore apps/api/NovaKart.slnx
+      - run: dotnet build apps/api/NovaKart.slnx --configuration Release --no-restore
+      - name: Reject model changes missing migrations
+        run: dotnet ef migrations has-pending-model-changes --project apps/api/NovaKart.Infraestructure --startup-project apps/api/NovaKart.WebApi --configuration Release --no-build
+      - name: Integration tests (Testcontainers starts PostgreSQL)
+        run: dotnet test apps/api/tests/NovaKart.WebApi.IntegrationTests --configuration Release --no-build --logger trx --results-directory test-results
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: api-test-results
+          path: test-results
+      - name: Validate container build
+        run: docker build --platform linux/amd64 --file apps/api/Dockerfile --tag novakart-api:ci apps/api
+      - name: Verify image user and environment files
+        run: |
+          test "$(docker image inspect novakart-api:ci --format '{{.Config.User}}')" != "0"
+          docker run --rm --entrypoint sh novakart-api:ci -c 'set -eu; test "$(id -u)" != 0; test -z "$(find /app -name ".env*" -print -quit)"'
+  deploy:
+    needs: validate
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.API_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    environment: develop
+    concurrency:
+      group: develop-api
+      cancel-in-progress: false
+    env:
+      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      AZURE_CONTAINER_APP_NAME: ${{ vars.AZURE_CONTAINER_APP_NAME }}
+      AZURE_ACR_NAME: ${{ vars.AZURE_ACR_NAME }}
+      AZURE_ACR_LOGIN_SERVER: ${{ vars.AZURE_ACR_LOGIN_SERVER }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify configuration
+        env:
+          CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          for variable in AZURE_RESOURCE_GROUP AZURE_CONTAINER_APP_NAME AZURE_ACR_NAME AZURE_ACR_LOGIN_SERVER CLIENT_ID TENANT_ID SUBSCRIPTION_ID; do
+            if [ -z "${!variable}" ]; then
+              echo "Missing variable: $variable" >&2
+              exit 1
+            fi
+          done
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Install Container Apps CLI extension
+        run: az extension add --name containerapp --upgrade --yes
+      - name: Build and push commit image
+        run: |
+          az acr login --name "$AZURE_ACR_NAME"
+          image="$AZURE_ACR_LOGIN_SERVER/novakart-api:$GITHUB_SHA"
+          docker build --platform linux/amd64 --file apps/api/Dockerfile --tag "$image" apps/api
+          docker push "$image"
+          echo "API_IMAGE=$image" >> "$GITHUB_ENV"
+      - name: Deploy container image
+        run: |
+          # Keep probes, runtime variables, secret references and scaling configured in Azure.
+          az containerapp update --name "$AZURE_CONTAINER_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --image "$API_IMAGE" --output none
+          az containerapp ingress enable --name "$AZURE_CONTAINER_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --type external --target-port 8080 --transport auto --allow-insecure false --output none
+          revision=$(az containerapp show --name "$AZURE_CONTAINER_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --query properties.latestRevisionName -o tsv)
+          echo "API_REVISION=$revision" >> "$GITHUB_ENV"
+          hostname=$(az containerapp show --name "$AZURE_CONTAINER_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --query properties.configuration.ingress.fqdn -o tsv)
+          test -n "$hostname"
+          echo "API_BASE_URL=https://$hostname" >> "$GITHUB_ENV"
+      - name: Wait for the deployed revision
+        run: |
+          for attempt in $(seq 1 48); do
+            # Wake a zero-replica revision before inspecting its health.
+            curl --fail --silent --max-time 5 "$API_BASE_URL/health" > /dev/null || true
+            health=$(az containerapp revision show --name "$AZURE_CONTAINER_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --revision "$API_REVISION" --query properties.healthState -o tsv)
+            if [ "$health" = Healthy ]; then exit 0; fi
+            sleep 10
+          done
+          echo "Revision $API_REVISION did not become healthy" >&2
+          exit 1
+      - name: Verify startup, migrations and database access
+        run: |
+          for path in /health/live /health '/api/v1/products?pageSize=1'; do
+            curl --fail --silent --show-error --retry 12 --retry-all-errors --retry-delay 10 --max-time 30 "$API_BASE_URL$path" > /dev/null
+          done
+      - name: Deployment summary
+        if: always()
+        run: |
+          {
+            echo "API deployment result: ${{ job.status }}"
+            echo "Image: ${API_IMAGE:-not pushed}"
+            echo "Revision: ${API_REVISION:-not recorded}"
+            echo "URL: ${API_BASE_URL:-not recorded}"
+            echo "A failed check does not automatically roll back the application or database."
+          } >> "$GITHUB_STEP_SUMMARY"

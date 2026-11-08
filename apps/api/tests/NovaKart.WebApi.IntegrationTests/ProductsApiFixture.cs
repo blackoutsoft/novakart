@@ -54,15 +54,21 @@ public sealed class ProductsApiFixture : IAsyncLifetime
         return string.Join(Environment.NewLine, lines);
     }
 
-    private sealed class ProductsApiFactory : WebApplicationFactory<Program>
+    internal sealed class ProductsApiFactory : WebApplicationFactory<Program>
     {
         private readonly string _connectionString;
+        private readonly bool _applyMigrations;
 
-        public ProductsApiFactory(string connectionString) => _connectionString = connectionString;
+        public ProductsApiFactory(string connectionString, bool applyMigrations = false)
+        {
+            _connectionString = connectionString;
+            _applyMigrations = applyMigrations;
+        }
 
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
             builder.UseEnvironment("Testing");
+            builder.UseSetting("Database:ApplyMigrationsOnStartup", _applyMigrations.ToString());
 
             builder.ConfigureTestServices(services =>
             {
